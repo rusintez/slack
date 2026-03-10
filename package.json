@@ -1,0 +1,47 @@
+{
+  "name": "@rusintez/slack",
+  "version": "0.1.0",
+  "description": "Agent-friendly Slack CLI with local sync",
+  "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "slack": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rusintez/slack"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "slack",
+    "cli",
+    "agent",
+    "ai",
+    "sync"
+  ],
+  "author": "rusintez",
+  "license": "MIT",
+  "dependencies": {
+    "@commander-js/extra-typings": "^13.0.0",
+    "commander": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
