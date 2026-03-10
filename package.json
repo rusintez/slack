@@ -1,6 +1,6 @@
 {
   "name": "@rusintez/slack",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Agent-friendly Slack CLI with local sync",
   "type": "module",
   "main": "./dist/index.js",
