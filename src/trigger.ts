@@ -2,17 +2,24 @@
  * Polling-based trigger system for Slack
  *
  * Watches channels for new messages and fires callbacks.
- * Processes messages in order, one at a time (queue model).
+ * Fetch-process-fetch model: fetches a batch, processes each message
+ * in order, then fetches the next batch. No unbounded queue.
+ *
+ * Persists watermark to disk so the bot can resume after restart
+ * without losing track of where it left off.
  *
  * Usage:
  *   const trigger = createTrigger({ token, channels: ['#general'] })
  *   trigger.on('message', async (msg, ctx) => {
  *     await ctx.reply('Got it!')
  *   })
- *   trigger.start()
+ *   await trigger.start()
  *   // later: trigger.stop()
  */
 
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import {
   getMessages,
   postMessage,
@@ -22,6 +29,10 @@ import {
   type SlackMessage,
 } from "./api.js";
 import { resolveChannel } from "./resolve.js";
+
+// ============================================================================
+// Types
+// ============================================================================
 
 export interface TriggerMessage {
   ts: string;
@@ -54,10 +65,7 @@ export type MessageHandler = (
   ctx: TriggerContext,
 ) => Promise<void> | void;
 
-export type ErrorHandler = (
-  error: Error,
-  message?: TriggerMessage,
-) => void;
+export type ErrorHandler = (error: Error, message?: TriggerMessage) => void;
 
 export interface TriggerOptions {
   /** Slack bot token */
@@ -66,7 +74,7 @@ export interface TriggerOptions {
   channels: string[];
   /** Poll interval in ms (default: 2000) */
   interval?: number;
-  /** Workspace name for resolve cache (optional) */
+  /** Workspace name for resolve cache and watermark persistence */
   workspace?: string;
   /** Ignore messages from bots including self (default: true) */
   ignoreBots?: boolean;
@@ -74,11 +82,6 @@ export interface TriggerOptions {
   ignoreSubtypes?: boolean;
   /** Only trigger on messages that mention the bot (default: false) */
   mentionsOnly?: boolean;
-}
-
-interface ChannelState {
-  id: string;
-  lastTs: string;
 }
 
 export interface Trigger {
@@ -94,6 +97,43 @@ export interface Trigger {
   readonly running: boolean;
 }
 
+// ============================================================================
+// Watermark persistence
+// ============================================================================
+
+interface WatermarkState {
+  /** channel ID → last processed message ts */
+  channels: Record<string, string>;
+}
+
+function getWatermarkDir(): string {
+  return join(homedir(), ".local", "share", "slack");
+}
+
+function getWatermarkFile(workspace: string): string {
+  const dir = join(getWatermarkDir(), workspace);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  return join(dir, ".trigger-watermark.json");
+}
+
+function loadWatermark(workspace: string): WatermarkState {
+  const file = getWatermarkFile(workspace);
+  if (!existsSync(file)) return { channels: {} };
+  try {
+    return JSON.parse(readFileSync(file, "utf-8"));
+  } catch {
+    return { channels: {} };
+  }
+}
+
+function saveWatermark(workspace: string, state: WatermarkState): void {
+  writeFileSync(getWatermarkFile(workspace), JSON.stringify(state, null, 2));
+}
+
+// ============================================================================
+// Trigger
+// ============================================================================
+
 export function createTrigger(options: TriggerOptions): Trigger {
   const {
     token,
@@ -108,48 +148,44 @@ export function createTrigger(options: TriggerOptions): Trigger {
   let running = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let botUserId: string | undefined;
-  const channelStates = new Map<string, ChannelState>();
+
+  // channel ID → last processed ts
+  const watermarks = new Map<string, string>();
+  const channelIds: string[] = [];
   const handlers: MessageHandler[] = [];
-  let errorHandler: ErrorHandler = (err) => console.error("[slack-trigger]", err.message);
+  let errorHandler: ErrorHandler = (err) =>
+    console.error("[slack-trigger]", err.message);
 
-  // Queue: process messages sequentially
-  const queue: Array<{ message: TriggerMessage; channelId: string }> = [];
-  let processing = false;
+  // Workspace name for persistence (falls back to "default")
+  const wsName = workspace || "default";
 
-  async function processQueue() {
-    if (processing) return;
-    processing = true;
-
-    while (queue.length > 0) {
-      const item = queue.shift()!;
-      const ctx = buildContext(item.message, item.channelId);
-
-      for (const handler of handlers) {
-        try {
-          await handler(item.message, ctx);
-        } catch (err) {
-          errorHandler(err instanceof Error ? err : new Error(String(err)), item.message);
-        }
-      }
+  function persistWatermarks() {
+    const state: WatermarkState = { channels: {} };
+    for (const [id, ts] of watermarks) {
+      state.channels[id] = ts;
     }
-
-    processing = false;
+    saveWatermark(wsName, state);
   }
 
-  function buildContext(message: TriggerMessage, channelId: string): TriggerContext {
+  function buildContext(
+    message: TriggerMessage,
+    channelId: string,
+  ): TriggerContext {
     const threadTs = message.thread_ts || message.ts;
-
     return {
       botUserId: botUserId!,
       token,
       reply: (text: string) =>
         postMessage(token, channelId, text, { thread_ts: threadTs }),
-      send: (text: string) =>
-        postMessage(token, channelId, text),
+      send: (text: string) => postMessage(token, channelId, text),
       react: (emoji: string) =>
         addReaction(token, channelId, message.ts, emoji),
       thread: async () => {
-        const { messages } = await getThreadReplies(token, channelId, threadTs);
+        const { messages } = await getThreadReplies(
+          token,
+          channelId,
+          threadTs,
+        );
         return messages;
       },
     };
@@ -158,60 +194,88 @@ export function createTrigger(options: TriggerOptions): Trigger {
   function shouldProcess(msg: SlackMessage): boolean {
     if (ignoreBots && (msg.bot_id || msg.user === botUserId)) return false;
     if (ignoreSubtypes && msg.subtype) return false;
-    if (mentionsOnly && botUserId && !msg.text.includes(`<@${botUserId}>`)) return false;
+    if (mentionsOnly && botUserId && !msg.text.includes(`<@${botUserId}>`))
+      return false;
     return true;
   }
 
-  async function poll() {
-    for (const [, state] of channelStates) {
+  /**
+   * Core loop: fetch one batch per channel, process each message
+   * in chronological order, advance watermark after each message,
+   * then wait before fetching again.
+   */
+  async function tick() {
+    for (const channelId of channelIds) {
+      const oldest = watermarks.get(channelId)!;
+
+      let batch: SlackMessage[];
       try {
-        const { messages } = await getMessages(token, state.id, {
-          oldest: state.lastTs,
+        const res = await getMessages(token, channelId, {
+          oldest,
           limit: 100,
         });
+        batch = res.messages;
+      } catch (err) {
+        errorHandler(
+          err instanceof Error ? err : new Error(String(err)),
+        );
+        continue;
+      }
 
-        // Messages come newest-first, reverse for chronological order
-        const newMessages = messages
-          .filter((m) => m.ts > state.lastTs)
-          .filter(shouldProcess)
-          .reverse();
+      // conversations.history returns newest-first, reverse for chronological
+      const newMessages = batch
+        .filter((m) => m.ts > oldest)
+        .filter(shouldProcess)
+        .reverse();
 
-        for (const msg of newMessages) {
-          queue.push({
-            message: {
-              ts: msg.ts,
-              text: msg.text,
-              user: msg.user,
-              channel: state.id,
-              thread_ts: msg.thread_ts,
-              reply_count: msg.reply_count,
-              bot_id: msg.bot_id,
-              subtype: msg.subtype,
-            },
-            channelId: state.id,
-          });
-        }
+      // Process each message sequentially
+      for (const msg of newMessages) {
+        const triggerMsg: TriggerMessage = {
+          ts: msg.ts,
+          text: msg.text,
+          user: msg.user,
+          channel: channelId,
+          thread_ts: msg.thread_ts,
+          reply_count: msg.reply_count,
+          bot_id: msg.bot_id,
+          subtype: msg.subtype,
+        };
 
-        // Advance watermark
-        if (messages.length > 0) {
-          const latest = messages[0].ts; // newest
-          if (latest > state.lastTs) {
-            state.lastTs = latest;
+        const ctx = buildContext(triggerMsg, channelId);
+
+        for (const handler of handlers) {
+          try {
+            await handler(triggerMsg, ctx);
+          } catch (err) {
+            errorHandler(
+              err instanceof Error ? err : new Error(String(err)),
+              triggerMsg,
+            );
           }
         }
-      } catch (err) {
-        errorHandler(err instanceof Error ? err : new Error(String(err)));
+
+        // Advance watermark after each message so a crash mid-batch
+        // resumes from the last successfully processed message
+        watermarks.set(channelId, msg.ts);
+        persistWatermarks();
+      }
+
+      // If batch had messages but all were filtered, still advance
+      // watermark to the newest ts so we don't re-fetch them
+      if (batch.length > 0) {
+        const newest = batch[0].ts;
+        if (newest > oldest) {
+          watermarks.set(channelId, newest);
+          persistWatermarks();
+        }
       }
     }
-
-    // Kick off processing (non-blocking relative to next poll)
-    processQueue();
   }
 
   function scheduleNext() {
     if (!running) return;
     timer = setTimeout(async () => {
-      await poll();
+      await tick();
       scheduleNext();
     }, interval);
   }
@@ -234,16 +298,20 @@ export function createTrigger(options: TriggerOptions): Trigger {
       const auth = await authTest(token);
       botUserId = auth.user_id;
 
-      // Resolve channel names → IDs and set initial watermark to "now"
+      // Load persisted watermarks (resume after crash)
+      const saved = loadWatermark(wsName);
       const nowTs = String(Date.now() / 1000);
+
+      // Resolve channel names → IDs
       for (const ch of channels) {
         const id = await resolveChannel(token, ch, workspace);
-        channelStates.set(id, { id, lastTs: nowTs });
+        channelIds.push(id);
+        // Use saved watermark if available, otherwise start from now
+        watermarks.set(id, saved.channels[id] || nowTs);
       }
 
       running = true;
-      // Do first poll immediately
-      await poll();
+      await tick();
       scheduleNext();
     },
 
