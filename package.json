@@ -1,9 +1,40 @@
 {
   "name": "@rusintez/slack",
-  "version": "0.1.1",
-  "description": "Agent-friendly Slack CLI with local sync",
+  "version": "0.2.0",
+  "description": "Agent-friendly Slack CLI and library with local sync and triggers",
   "type": "module",
-  "main": "./dist/index.js",
+  "main": "./dist/lib.js",
+  "types": "./dist/lib.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/lib.d.ts",
+      "import": "./dist/lib.js"
+    },
+    "./api": {
+      "types": "./dist/api.d.ts",
+      "import": "./dist/api.js"
+    },
+    "./config": {
+      "types": "./dist/config.d.ts",
+      "import": "./dist/config.js"
+    },
+    "./sync": {
+      "types": "./dist/sync.d.ts",
+      "import": "./dist/sync.js"
+    },
+    "./resolve": {
+      "types": "./dist/resolve.d.ts",
+      "import": "./dist/resolve.js"
+    },
+    "./output": {
+      "types": "./dist/output.d.ts",
+      "import": "./dist/output.js"
+    },
+    "./trigger": {
+      "types": "./dist/trigger.d.ts",
+      "import": "./dist/trigger.js"
+    }
+  },
   "bin": {
     "slack": "dist/index.js"
   },
@@ -28,7 +59,9 @@
     "cli",
     "agent",
     "ai",
-    "sync"
+    "sync",
+    "trigger",
+    "bot"
   ],
   "author": "rusintez",
   "license": "MIT",
