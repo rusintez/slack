@@ -201,10 +201,13 @@ export function createTrigger(options: TriggerOptions): Trigger {
 
   /**
    * Core loop: fetch one batch per channel, process each message
-   * in chronological order, advance watermark after each message,
-   * then wait before fetching again.
+   * in chronological order, advance watermark after each message.
+   * Returns true if any messages were processed (caller should
+   * fetch again immediately instead of sleeping).
    */
-  async function tick() {
+  async function tick(): Promise<boolean> {
+    let processed = false;
+
     for (const channelId of channelIds) {
       const oldest = watermarks.get(channelId)!;
 
@@ -258,6 +261,7 @@ export function createTrigger(options: TriggerOptions): Trigger {
         // resumes from the last successfully processed message
         watermarks.set(channelId, msg.ts);
         persistWatermarks();
+        processed = true;
       }
 
       // If batch had messages but all were filtered, still advance
@@ -270,14 +274,25 @@ export function createTrigger(options: TriggerOptions): Trigger {
         }
       }
     }
+
+    return processed;
   }
 
-  function scheduleNext() {
-    if (!running) return;
-    timer = setTimeout(async () => {
-      await tick();
-      scheduleNext();
-    }, interval);
+  async function loop() {
+    while (running) {
+      const hadWork = await tick();
+      if (!running) break;
+      if (!hadWork) {
+        // Nothing to process — sleep before next poll
+        await new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            timer = null;
+            resolve();
+          }, interval);
+        });
+      }
+      // Had work — fetch again immediately
+    }
   }
 
   const trigger: Trigger = {
@@ -311,8 +326,7 @@ export function createTrigger(options: TriggerOptions): Trigger {
       }
 
       running = true;
-      await tick();
-      scheduleNext();
+      loop();
     },
 
     stop() {
